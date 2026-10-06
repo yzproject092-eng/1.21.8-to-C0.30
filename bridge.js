@@ -10,6 +10,9 @@
  */
 const net = require('net')
 const zlib = require('zlib')
+const fs = require('fs')
+const path = require('path')
+const http = require('http')
 const { promisify } = require('util')
 const { Vec3 } = require('vec3')
 
@@ -21,6 +24,8 @@ const CFG = {
   mcPort: +process.env.MC_PORT || 25565,
   version: process.env.MC_VERSION || '1.21.8',
   password: process.env.BRIDGE_PASSWORD || '', //    пароль в поле Mppass клиента (пусто = без проверки)
+  httpPort: +process.env.HTTP_PORT || 8080, //        раздача default.zip
+  textureUrl: process.env.TEXTURE_URL || '', //       публичный URL текстурпака (<=64 символов); пусто = авто
   serverName: 'Paper bridge',
   motd: 'Classic -> Paper 1.21.8',
   viewDistance: 6, //                                 радиус прогрузки чанков ботом (меньше = легче серверу)
@@ -33,142 +38,39 @@ const SY = 128
 const SZ = 128
 const EYE = 51 / 32 // смещение глаз в Classic-протоколе
 
-/* ------------------------- карта блоков ------------------------- */
-// Блоки Classic: 0 воздух, 1 камень, 2 трава, 3 земля, 4 булыжник, 5 доски, 6 саженец, 7 бедрок,
-// 8/9 вода, 10/11 лава, 12 песок, 13 гравий, 14 золотая руда, 15 железная, 16 угольная, 17 бревно,
-// 18 листва, 19 губка, 20 стекло, 21-36 шерсть (16 цветов), 37 одуванчик, 38 роза, 39/40 грибы,
-// 41 золото, 42 железо, 43 двойная плита, 44 плита, 45 кирпич, 46 TNT, 47 книжная полка,
-// 48 замшелый камень, 49 обсидиан
-//
-// Порядок решения для каждого состояния блока:
-//   1) preId()  - явные правила по имени (важнее формы блока)
-//   2) нет коллизии -> воздух (факелы, кнопки, таблички, рельсы, трава...)
-//   3) неполный блок ниже половины -> плита 44; остальные (лестницы, заборы...) -> целый блок fullId()
-//   4) целый блок -> fullId() по семействам, неизвестное -> стекло
-// Правило 3 нарочно "не ниже, чем на сервере": так игрока не вдавливает в блок.
+/* ------------------------- карта блоков (blocklist.txt) ------------------------- */
+// Формат blocklist.txt:  имя_в_Minecraft = id_ClassiCube   (# - комментарий)
+// default = N  - id для блоков, которых нет в списке. Состояния блоков игнорируются, важно только имя.
+// air / cave_air / void_air = 0, если не заданы явно.
 const GLASS = 20
-const WOODS = 'oak|spruce|birch|jungle|acacia|dark_oak|mangrove|cherry|pale_oak|bamboo|crimson|warped'
-const WOOD_RE = new RegExp(`^(${WOODS})$`)
-const COLORS = { // цвет Java -> шерсть Classic
-  red: 21, orange: 22, yellow: 23, lime: 24, green: 25, light_blue: 27, cyan: 28, blue: 29,
-  purple: 30, magenta: 32, pink: 33, black: 34, gray: 35, light_gray: 35, white: 36, brown: 22
-}
-const RED_FLOWER = /^(poppy|red_tulip|pink_tulip|rose_bush|peony|wither_rose|torchflower|pink_petals|cactus_flower|spore_blossom)$/
-const ANY_FLOWER = /^(dandelion|golden_dandelion|poppy|blue_orchid|allium|azure_bluet|[a-z]+_tulip|oxeye_daisy|cornflower|lily_of_the_valley|wither_rose|sunflower|lilac|rose_bush|peony|torchflower|pitcher_plant|pink_petals|wildflowers|spore_blossom|open_eyeblossom|closed_eyeblossom|cactus_flower)$/
+const BLOCKLIST_FILE = process.env.BLOCKLIST || path.join(__dirname, 'blocklist.txt')
 
-/** Явные правила (срабатывают раньше формы блока). undefined = правила нет. */
-function preId (n) {
-  if (/^(air|cave_air|void_air|structure_void|light|snow|lily_pad|flower_pot|moving_piston|ladder)$|_hanging_sign$|_wall_head$|_wall_skull$/.test(n)) return 0
-  if (/^(water|bubble_column|kelp|kelp_plant|seagrass|tall_seagrass)$/.test(n)) return 9
-  if (n === 'lava') return 11
-  // светящиеся блоки -> неподвижная лава (как просили для светокамня)
-  if (/^(glowstone|sea_lantern|shroomlight|redstone_lamp|magma_block)$|_froglight$/.test(n)) return 11
-  if (n === 'nether_portal') return 33 //                    розовая шерсть
-  if (n === 'netherite_block' || n === 'ancient_debris') return 34 // чёрная шерсть
-  if (/^(sugar_cane|bamboo|bamboo_sapling)$/.test(n)) return 37 //  тростник/бамбук -> цветок
-  if (n.startsWith('potted_')) {
-    const r = n.slice(7)
-    if (ANY_FLOWER.test(r)) return RED_FLOWER.test(r) ? 38 : 37
-    if (/_sapling$|^(azalea_bush)$/.test(r)) return 6
-    if (r === 'brown_mushroom') return 39
-    if (r === 'red_mushroom') return 40
-    return 0
+function loadBlocklist (file) {
+  const names = new Map(); let def = 1
+  let txt = ''
+  try { txt = fs.readFileSync(file, 'utf8') } catch { console.warn(`[blocklist] нет файла ${file}: все блоки -> ${def}`) }
+  for (const raw of txt.split(/\r?\n/)) {
+    const m = /^([a-z0-9_:]+)\s*=\s*(\d+)$/i.exec(raw.replace(/#.*$/, '').trim())
+    if (!m || +m[2] > 255) continue
+    const name = m[1].toLowerCase().replace(/^minecraft:/, '')
+    if (name === 'default') def = +m[2]; else names.set(name, +m[2])
   }
-  if (ANY_FLOWER.test(n)) return RED_FLOWER.test(n) ? 38 : 37
-  if (/_sapling$|^mangrove_propagule$/.test(n)) return 6
-  if (n === 'brown_mushroom') return 39
-  if (n === 'red_mushroom') return 40
-  if (/^(flowering_)?azalea$/.test(n)) return 18
-  if (/^(cobblestone|cobbled_deepslate|infested_cobblestone)$/.test(n)) return 1 // булыжник = камень
-  if (/_trapdoor$/.test(n)) return 44 //                                        люк = плита
-  return undefined
+  return { names, def }
 }
 
-const EXACT = {
-  stone: 1, grass_block: 2, dirt: 3, bedrock: 7, sand: 12, red_sand: 12, suspicious_sand: 12,
-  gravel: 13, suspicious_gravel: 13, sponge: 19, wet_sponge: 19, gold_block: 41, iron_block: 42,
-  bricks: 45, tnt: 46, bookshelf: 47, chiseled_bookshelf: 47, obsidian: 49, crying_obsidian: 49,
-  snow_block: 36, powder_snow: 36, bone_block: 36, quartz_block: 36, hay_block: 23, honey_block: 22,
-  slime_block: 24, emerald_block: 25, lapis_block: 29, redstone_block: 21, coal_block: 34,
-  diamond_block: 28, amethyst_block: 31, moss_block: 25, cactus: 25, pumpkin: 22, carved_pumpkin: 22,
-  jack_o_lantern: 22, melon: 24, mushroom_stem: 36, brown_mushroom_block: 22, red_mushroom_block: 21,
-  nether_wart_block: 21, warped_wart_block: 27, crimson_nylium: 21, warped_nylium: 27,
-  raw_iron_block: 42, raw_gold_block: 41, raw_copper_block: 41, anvil: 42, chipped_anvil: 42,
-  damaged_anvil: 42, cauldron: 42, hopper: 42, clay: 35, terracotta: 22, shulker_box: 31,
-  bamboo_mosaic: 5, bamboo_block: 5, stripped_bamboo_block: 5
-}
-
-/** Правила для целых блоков по имени. undefined = ничего не подошло. */
-function fullRule (n) {
-  let m
-  if (n in EXACT) return EXACT[n]
-  if ((m = /^(.+?)_(wool|concrete|concrete_powder|terracotta|glazed_terracotta|shulker_box|bed|carpet|banner)$/.exec(n)) && COLORS[m[1]]) return COLORS[m[1]]
-  if ((m = /^(dead_)?(tube|brain|bubble|fire|horn)_coral_block$/.exec(n))) return m[1] ? 35 : { tube: 29, brain: 33, bubble: 32, fire: 21, horn: 23 }[m[2]]
-  if (/^(muddy_)?mangrove_roots$/.test(n)) return 17
-  if (/^mossy_/.test(n)) return 48
-  if (/glass$|ice$/.test(n)) return 20
-  if (/_planks$/.test(n)) return 5
-  if (/^(crafting_table|chest|trapped_chest|barrel|note_block|jukebox|loom|lectern|cartography_table|fletching_table|smithing_table|composter)$/.test(n)) return 5
-  if (/_leaves$/.test(n)) return 18
-  if (/^(stripped_)?(crimson|warped)_(stem|hyphae)$|(_log|_wood)$/.test(n)) return 17
-  if (/(^|_)coal_ore$/.test(n)) return 16
-  if (/(^|_)iron_ore$/.test(n)) return 15
-  if (/(^|_)gold_ore$/.test(n)) return 14
-  if (/_ore$/.test(n)) return 1
-  if (/^(coarse_dirt|podzol|mycelium|rooted_dirt|farmland|dirt_path|mud|packed_mud|soul_sand|soul_soil|dripstone_block|pointed_dripstone)$/.test(n)) return 3
-  if (/sandstone$/.test(n)) return 12
-  if (/(nether|mud|resin)_bricks$/.test(n)) return 45
-  if (/quartz|purpur/.test(n)) return 36
-  if (/prismarine/.test(n)) return 28
-  if (/copper/.test(n)) return 41
-  if (/^sculk/.test(n)) return 34
-  if (/stone|deepslate|tuff|andesite|diorite|granite|basalt|calcite|netherrack|furnace|smoker|dispenser|dropper|observer|piston|crafter|grindstone/.test(n)) return 1
-  return undefined
-}
-
-const SUFFIX = /_(stairs|slab|wall|fence_gate|fence)$/
-
-/** Целый блок для данного имени; лестницы/плиты/заборы берут материал основы. */
-function fullId (n) {
-  const m = SUFFIX.exec(n)
-  if (m) {
-    const base = n.slice(0, m.index)
-    if (WOOD_RE.test(base)) return 5
-    for (const c of [base, base + 's', base + '_bricks', base + '_planks', base + '_block']) {
-      const v = preId(c) ?? fullRule(c)
-      if (v !== undefined) return v
-    }
-  }
-  return fullRule(n) ?? GLASS
-}
-
-function shapeBoxes (mcData, b, idx) {
-  const cs = mcData.blockCollisionShapes
-  const ids = cs?.blocks?.[b.name]
-  if (ids === undefined) return b.boundingBox === 'block' ? [[0, 0, 0, 1, 1, 1]] : []
-  return cs.shapes[Array.isArray(ids) ? ids[idx] : ids] || []
-}
-
-function classifyState (mcData, b, idx) {
-  const pre = preId(b.name)
-  if (pre !== undefined) return pre
-  const boxes = shapeBoxes(mcData, b, idx)
-  if (!boxes.length) return 0 //                        без коллизии -> воздух
-  const top = Math.max(...boxes.map(x => x[4]))
-  const full = boxes.some(x => x[0] < 0.01 && x[1] < 0.01 && x[2] < 0.01 && x[3] > 0.99 && x[4] > 0.99 && x[5] > 0.99)
-  if (!full && top <= 0.5 + 1e-6) return 44 //          низкие неполные блоки -> плита
-  return fullId(b.name)
-}
-
-/** Таблица stateId -> id Classic для данной версии. */
-function buildStateMap (mcData) {
+/** Таблица stateId -> id Classic: только по имени блока из blocklist.txt. */
+function buildStateMap (mcData, file = BLOCKLIST_FILE) {
+  const { names, def } = loadBlocklist(file)
+  for (const n of names.keys()) if (!mcData.blocksByName[n]) console.warn(`[blocklist] блока "${n}" нет в этой версии`)
   const max = mcData.blocksArray.reduce((m, b) => Math.max(m, b.maxStateId), 0)
-  const map = new Uint8Array(max + 1).fill(GLASS)
+  const map = new Uint8Array(max + 1).fill(def)
   for (const b of mcData.blocksArray) {
-    for (let st = b.minStateId; st <= b.maxStateId; st++) map[st] = classifyState(mcData, b, st - b.minStateId)
+    const id = names.get(b.name) ?? (/^(air|cave_air|void_air)$/.test(b.name) ? 0 : def)
+    map.fill(id, b.minStateId, b.maxStateId + 1)
   }
   return map
 }
+
 
 /* ------------------------- сборка мира ------------------------- */
 function computeOrigin (pos, game) {
@@ -242,7 +144,15 @@ const P = {
     b[1] = id & 255; b.writeInt16BE(fx(x), 2); b.writeInt16BE(fx(y), 4); b.writeInt16BE(fx(z), 6); b[8] = yaw; b[9] = pitch
   }),
   despawn: id => Buffer.from([0x0c, id & 255]),
-  message: text => Buffer.concat([Buffer.from([0x0d, 0]), str64(text)]),
+  message: (text, type = 0) => Buffer.concat([Buffer.from([0x0d, type]), str64(text)]), // type 100 = надпись над хотбаром
+  weather: w => Buffer.from([0x1f, w]), //                                              0 ясно, 1 дождь
+  tabAdd: (id, name, list) => { const b = Buffer.alloc(3); b[0] = 0x16; b.writeInt16BE(id, 1); return Buffer.concat([b, str64(name), str64(list), str64('Players'), Buffer.from([0])]) },
+  spawnEnt: (id, x, y, z, yaw) => Buffer.concat([ // ExtAddEntity2: безымянная сущность (для мобов)
+    Buffer.from([0x21, id & 255]), str64(''), str64(''),
+    pkt(0, 8, b => { b.writeInt16BE(fx(x), 0); b.writeInt16BE(fx(y), 2); b.writeInt16BE(fx(z), 4); b[6] = yaw; b[7] = 0 })
+  ]),
+  model: (id, name) => Buffer.concat([Buffer.from([0x1d, id & 255]), str64(name)]), // ChangeModel
+  tabRemove: id => { const b = Buffer.alloc(3); b[0] = 0x18; b.writeInt16BE(id, 1); return b },
   kick: reason => Buffer.concat([Buffer.from([0x0e]), str64(reason)]),
   extInfo: (app, n) => Buffer.concat([Buffer.from([0x10]), str64(app), Buffer.from([n >> 8, n & 255])]),
   extEntry: (name, ver) => {
@@ -250,9 +160,11 @@ const P = {
     v.writeInt32BE(ver)
     return Buffer.concat([Buffer.from([0x11]), str64(name), v])
   },
+  texUrl: url => Buffer.concat([Buffer.from([0x28]), str64(url)]), // EnvSetMapUrl
   hotbar: (block, index) => Buffer.from([0x2d, block, index])
 }
-const OUR_EXTS = [['SetHotbar', 1]]
+const OUR_EXTS = [['SetHotbar', 1], ['EnvMapAspect', 1], ['EnvMapAppearance', 1], ['ExtPlayerList', 2], ['EnvWeatherType', 1], ['MessageTypes', 1], ['ChangeModel', 1]]
+const TEX_FILE = process.env.TEXTURE_FILE || path.join(__dirname, 'default.zip')
 
 /** Причина кика (строка JSON или NBT из 1.20.3+) -> обычный текст. */
 function reasonText (r) {
@@ -271,6 +183,17 @@ function reasonText (r) {
     return walk(r) || JSON.stringify(r)
   } catch { return 'unknown reason' }
 }
+
+// Мобы Paper -> модели ClassiCube (humanoid, chicken, creeper, pig, sheep, skeleton, spider, zombie, giant, ...).
+// Чего нет в таблице - не показывается. Правьте под себя.
+const MOBS = {
+  sheep: 'sheep', pig: 'pig', cow: 'pig', mooshroom: 'pig', chicken: 'chicken', creeper: 'creeper',
+  skeleton: 'skeleton', stray: 'skeleton', bogged: 'skeleton', wither_skeleton: 'skeleton',
+  zombie: 'zombie', husk: 'zombie', drowned: 'zombie', zombie_villager: 'zombie', zombified_piglin: 'zombie',
+  spider: 'spider', cave_spider: 'spider', villager: 'humanoid', enderman: 'humanoid', witch: 'humanoid',
+  pillager: 'humanoid', vindicator: 'humanoid', iron_golem: 'giant'
+}
+const MAX_MOBS_ID = 100 // id Classic 0..126: мобам до 100, остальное для игроков
 
 const yawByte = rad => Math.round((((rad * 180 / Math.PI) + 180) % 360 + 360) % 360 * 256 / 360) & 255
 
@@ -384,6 +307,9 @@ class Session {
     this.work = Promise.resolve() // очередь действий с блоками
     this.ents = new Map() // entity.id -> classic id
     this.lastEnt = new Map()
+    this.tab = new Map() //   username -> {id, text} (ExtPlayerList)
+    this.lastStatus = ''
+    this.weather = -1
     sock.setNoDelay(true)
     sock.on('data', d => this.onData(d))
     sock.on('close', () => this.close())
@@ -473,6 +399,7 @@ class Session {
     await Promise.race([bot.waitForChunksToLoad(), new Promise(r => setTimeout(r, 8000))])
     this.origin = computeOrigin(bot.entity.position, bot.game)
     this.send(P.ident(CFG.serverName, CFG.motd))
+    this.sendTexture()
     await this.sendLevel()
     this.hookBot()
     this.ready = true
@@ -500,9 +427,69 @@ class Session {
     this.syncHotbar(true)
     // ClassiCube может сбросить хотбар после загрузки уровня, поэтому шлём ещё раз
     for (const t of [400, 1500, 4000]) setTimeout(() => { if (!this.closed && this.ready) this.syncHotbar(true) }, t)
+    setTimeout(() => { if (!this.closed && this.ready) { this.syncTab(true); this.sendWeather(true); this.sendStatus(true) } }, 600)
     for (const ent of Object.values(bot.entities || {})) this.trackEntity(ent)
     this.lastReload = Date.now()
     this.loading = false
+  }
+
+  /** CPE: если клиент умеет EnvMapAspect - отдаём ссылку на default.zip. */
+  sendTexture () {
+    const why = !this.cpe ? 'клиент без CPE' : !fs.existsSync(TEX_FILE) ? `нет файла ${TEX_FILE}`
+      : !(this.exts.has('EnvMapAspect') || this.exts.has('EnvMapAppearance')) ? 'клиент не заявил EnvMapAspect/EnvMapAppearance' : ''
+    if (why) return console.log(`[${this.name}] текстурпак не отправлен: ${why}`)
+    const url = CFG.textureUrl || `http://${String(this.sock.localAddress).replace(/^::ffff:/, '')}:${CFG.httpPort}/default.zip`
+    if (url.length > 64) return console.warn(`[texture] URL длиннее 64 символов: ${url} (задайте TEXTURE_URL)`)
+    // EnvMapAspect (0x28) или старый EnvMapAppearance v1 (0x1E: url, side=7, edge=8, level=0)
+    this.send(this.exts.has('EnvMapAspect') ? P.texUrl(url)
+      : Buffer.concat([Buffer.from([0x1e]), str64(url), Buffer.from([7, 8, 0, 0])]))
+    console.log(`[${this.name}] текстурпак отправлен: ${url}`)
+  }
+
+  /* --- статусбар: HP и еда над хотбаром (CPE MessageTypes), команда .status --- */
+  statusText () {
+    const b = this.bot
+    const hp = Math.max(0, Math.ceil(b.health ?? 0)); const food = Math.max(0, Math.round(b.food ?? 0))
+    const bar = (v, c) => { const f = Math.min(10, Math.round(v / 2)); return `&8I${c}${'o'.repeat(f)}&8${'o'.repeat(10 - f)}I` }
+    return `${bar(hp, '&c')} &f${hp} hp ${bar(food, '&6')} &f${food} eat`
+  }
+
+  sendStatus (force, chat) {
+    if (!this.ready || !this.bot) return
+    const t = this.statusText()
+    if (!force && t === this.lastStatus) return
+    this.lastStatus = t
+    if (this.exts.has('MessageTypes')) this.send(P.message(t, 100))
+    else if (chat) this.sendChat(t)
+  }
+
+  /* --- погода (CPE EnvWeatherType): дождь/гроза -> дождь --- */
+  sendWeather (force) {
+    if (!this.exts.has('EnvWeatherType') || !this.bot) return
+    const w = this.bot.isRaining ? 1 : 0
+    if (!force && w === this.weather) return
+    this.weather = w
+    this.send(P.weather(w))
+  }
+
+  /* --- TAB (CPE ExtPlayerList): игроки Paper + пинг --- */
+  syncTab (force) {
+    if (!this.exts.has('ExtPlayerList') || !this.bot?.players) return
+    const seen = new Set()
+    for (const p of Object.values(this.bot.players)) {
+      if (!p.username) continue
+      seen.add(p.username)
+      let t = this.tab.get(p.username)
+      if (!t) {
+        const used = new Set([...this.tab.values()].map(v => v.id)); let id = 0
+        while (used.has(id)) id++
+        if (id > 254) continue
+        this.tab.set(p.username, t = { id, text: null })
+      }
+      const text = ruToLatin(p.username) + (p.ping > 0 ? ` &7${p.ping}ms` : '')
+      if (force || t.text !== text) { t.text = text; this.send(P.tabAdd(t.id, p.username, text)) }
+    }
+    for (const [n, t] of this.tab) if (!seen.has(n)) { this.send(P.tabRemove(t.id)); this.tab.delete(n) }
   }
 
   hookBot () {
@@ -529,6 +516,9 @@ class Session {
     })
     bot.inventory?.on('updateSlot', slot => { if (slot >= 36 && slot <= 44) this.syncHotbar() })
     this.hotTimer = setInterval(() => this.syncHotbar(), 1000) // страховка, если событие инвентаря пропущено
+    bot.on('health', () => this.sendStatus())
+    bot.on('weatherUpdate', () => this.sendWeather())
+    for (const ev of ['playerJoined', 'playerLeft', 'playerUpdated']) bot.on(ev, () => this.syncTab())
     bot.on('entitySpawn', e => this.trackEntity(e))
     bot.on('entityMoved', e => this.trackEntity(e))
     bot.on('entityGone', e => {
@@ -558,7 +548,10 @@ class Session {
   /* --- другие игроки --- */
   trackEntity (e) {
     if (!this.ready && !this.loading) return
-    if (!e || e.type !== 'player' || e === this.bot.entity || !e.username) return
+    if (!e || e === this.bot.entity) return
+    const isP = e.type === 'player' && !!e.username
+    const model = isP ? null : MOBS[e.name]
+    if (!isP && (!model || !this.exts.has('ChangeModel') || !this.exts.has('ExtPlayerList'))) return
     const o = this.origin
     const x = e.position.x - o.x; const y = e.position.y - o.y; const z = e.position.z - o.z
     const inside = x >= 0 && y >= 0 && z >= 0 && x < SX && y < SY && z < SZ
@@ -570,9 +563,10 @@ class Session {
     if (cid === undefined) {
       const used = new Set(this.ents.values())
       for (cid = 0; cid < 127 && used.has(cid); cid++);
-      if (cid >= 127) return
+      if (cid >= (isP ? 127 : MAX_MOBS_ID)) return
       this.ents.set(e.id, cid)
-      this.send(P.spawn(cid, e.username, x, y + EYE, z, yawByte(e.yaw), 0))
+      if (isP) this.send(P.spawn(cid, e.username, x, y + EYE, z, yawByte(e.yaw), 0))
+      else { this.send(P.spawnEnt(cid, x, y + EYE, z, yawByte(e.yaw))); this.send(P.model(cid, model)) }
       return
     }
     const now = Date.now()
@@ -622,6 +616,7 @@ class Session {
     const cmd = msg.toLowerCase()
     if (cmd === '!ru') { this.ru = true; return this.sendChat('&aRU rezhim vkljuchen: pishite translitom (privet = привет). !en - vyhod') }
     if (cmd === '!en') { this.ru = false; return this.sendChat('&aRU rezhim vykljuchen') }
+    if (cmd === '.status' || cmd === '!status') return this.sendStatus(true, true)
     this.bot.chat(this.ru && !msg.startsWith('/') ? latinToRu(msg) : msg)
   }
 
@@ -707,6 +702,16 @@ function startBridge (opts = {}) {
     stateMap: buildStateMap(mcData),
     itemId (name) { const b = mcData.blocksByName[name]; return b ? this.stateMap[b.defaultState] : undefined },
     createBot: opts.createBot || (o => require('mineflayer').createBot(o))
+  }
+  if (opts.http !== false) {
+    const web = http.createServer((req, res) => {
+      console.log(`[texture] http ${req.method} ${req.url} от ${req.socket.remoteAddress}`)
+      if (!fs.existsSync(TEX_FILE)) { res.writeHead(404); return res.end() }
+      res.writeHead(200, { 'Content-Type': 'application/zip', 'Content-Length': fs.statSync(TEX_FILE).size })
+      fs.createReadStream(TEX_FILE).pipe(res)
+    })
+    web.on('error', e => console.warn('[texture] http:', e.message))
+    web.listen(opts.httpPort ?? CFG.httpPort)
   }
   const server = net.createServer(sock => new Session(sock, br))
   server.listen(opts.port ?? CFG.listenPort, () => console.log(`Classic bridge on :${server.address().port} -> ${CFG.mcHost}:${CFG.mcPort} (${CFG.version})`))
