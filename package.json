@@ -1,0 +1,8 @@
+{
+  "name": "classic-paper-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "main": "bridge.js",
+  "scripts": { "start": "node bridge.js", "test": "node test.js" },
+  "dependencies": { "mineflayer": "^4.39.0" }
+}
