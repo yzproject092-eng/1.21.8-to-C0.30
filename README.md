@@ -40,4 +40,9 @@ If the bridge runs on the same server as Minecraft, use a different `LISTEN_PORT
 
 After starting the bridge, connect to the bridge using **ClassiCube**.
 
-See **[HOWtoCONNECT.jpg](https://github.com/yzproject092-eng/1.21.8-to-C0.30/blob/main/HOWtoCONNECT.jpg)** to see what to enter in ClassiCube when connecting.
+<img width="333" height="235" alt="image" src="https://github.com/user-attachments/assets/ff8417f7-8ccb-42d0-b793-d73460f502f4" />
+
+
+## Screenshot
+<img width="1280" height="674" alt="image" src="https://github.com/user-attachments/assets/69ee627b-9a18-460a-a8a0-a753919bfcf4" />
+
