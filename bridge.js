@@ -39,7 +39,7 @@ const SZ = 128
 const EYE = 51 / 32 // смещение глаз в Classic-протоколе
 
 /* ------------------------- карта блоков (blocklist.txt) ------------------------- */
-// Формат blocklist.txt:  имя_в_Minecraft = id_ClassiCube   (# - комментарий)
+// blocklist.txt НЕОБЯЗАТЕЛЕН (id берутся из .cw по имени блока); если файл есть - его строки главнее. Формат:  имя_в_Minecraft = id_ClassiCube   (# - комментарий)
 // default = N  - id для блоков, которых нет в списке. Состояния блоков игнорируются, важно только имя.
 // air / cave_air / void_air = 0, если не заданы явно.
 const GLASS = 20
@@ -48,7 +48,7 @@ const BLOCKLIST_FILE = process.env.BLOCKLIST || path.join(__dirname, 'blocklist.
 function loadBlocklist (file) {
   const names = new Map(); let def = 1
   let txt = ''
-  try { txt = fs.readFileSync(file, 'utf8') } catch { console.warn(`[blocklist] нет файла ${file}: все блоки -> ${def}`) }
+  try { txt = fs.readFileSync(file, 'utf8') } catch { /* blocklist.txt необязателен */ }
   for (const raw of txt.split(/\r?\n/)) {
     const m = /^([a-z0-9_:]+)\s*=\s*(\d+)$/i.exec(raw.replace(/#.*$/, '').trim())
     if (!m || +m[2] > 255) continue
@@ -58,16 +58,79 @@ function loadBlocklist (file) {
   return { names, def }
 }
 
+/* ---- определения блоков из .cw (ClassicWorld): Metadata.CPE.BlockDefinitions ---- */
+function readNbt (buf) {
+  let p = 0
+  const str = () => { const n = buf.readUInt16BE(p); p += 2; return buf.toString('utf8', p, (p += n)) }
+  const val = t => {
+    switch (t) {
+      case 1: return buf.readInt8(p++)
+      case 2: { const v = buf.readInt16BE(p); p += 2; return v }
+      case 3: { const v = buf.readInt32BE(p); p += 4; return v }
+      case 4: case 6: p += 8; return 0
+      case 5: { const v = buf.readFloatBE(p); p += 4; return v }
+      case 7: { const n = buf.readInt32BE(p); p += 4; const v = n <= 64 ? Array.from(buf.subarray(p, p + n)) : null; p += n; return v }
+      case 8: return str()
+      case 9: { const et = buf[p]; const n = buf.readInt32BE(p + 1); p += 5; return Array.from({ length: n }, () => val(et)) }
+      case 10: { const o = {}; for (;;) { const tt = buf[p++]; if (!tt) return o; const k = str(); o[k] = val(tt) } }
+      case 11: { const n = buf.readInt32BE(p); p += 4 + 4 * n; return null }
+      case 12: { const n = buf.readInt32BE(p); p += 4 + 8 * n; return null }
+    }
+    throw new Error('nbt: тег ' + t)
+  }
+  p++; str(); return val(10)
+}
+const normName = s => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '')
+const CW_FILE = process.env.BLOCKDEFS || (fs.readdirSync(__dirname).find(f => /\.cw$/i.test(f)) || '')
+
+let cwCache
+function readCw () {
+  if (cwCache) return cwCache
+  cwCache = []
+  if (!CW_FILE) return cwCache
+  try {
+    const root = readNbt(zlib.gunzipSync(fs.readFileSync(path.resolve(__dirname, CW_FILE))))
+    cwCache = Object.values(root.Metadata?.CPE?.BlockDefinitions || {})
+  } catch (e) { console.warn('[blockdefs]', e.message) }
+  return cwCache
+}
+
+/** id (1..255) -> определение блока. В .cw три банка (ID2 = ID, ID+256, ID+512): берём тот, чьё имя совпало с blocklist.txt, иначе банк 0. */
+function loadBlockDefs (names) {
+  const defs = new Map()
+  if (!CW_FILE) return defs
+  const all = readCw()
+  const byId = new Map()
+  for (const d of all) { const id = d.ID & 255; if (!byId.has(id)) byId.set(id, []); byId.get(id).push(d) }
+  const used = new Set(names.values())
+  for (const id of used) {
+    if (id < 1) continue
+    const c = byId.get(id) || []
+    // банк 0 (ID2 === id) всегда главнее: одинаковый младший байт у блока и у предмета из другого банка (вода 8 и ведро воды 264)
+    const d = c.find(x => x.ID2 === id) || c.find(x => [...names].some(([n, v]) => v === id && n === normName(x.Name))) || c[0]
+    if (d) defs.set(id, d)
+  }
+  console.log(`[blockdefs] ${CW_FILE}: определений в файле ${all.length}, будет отправлено ${defs.size}`)
+  return defs
+}
+
 /** Таблица stateId -> id Classic: только по имени блока из blocklist.txt. */
 function buildStateMap (mcData, file = BLOCKLIST_FILE) {
-  const { names, def } = loadBlocklist(file)
-  for (const n of names.keys()) if (!mcData.blocksByName[n]) console.warn(`[blocklist] блока "${n}" нет в этой версии`)
+  const { names, def } = loadBlocklist(file) // blocklist.txt необязателен: если есть - его записи главнее
+  // авто-список из .cw: имя блока (Stone -> stone, Oak Planks -> oak_planks) -> id, только банк 0 (ID2 = ID, 1..255)
+  for (const d of readCw()) { const n = normName(d.Name); if (d.ID2 === (d.ID & 255) && d.ID2 > 0 && !names.has(n)) names.set(n, d.ID2) }
+  // имена, которых нет среди блоков и предметов версии (варианты поворота _w/_n, свои блоки и т.п.) - не ошибка, просто не используются
+  const unused = [...names.keys()].filter(n => !mcData.blocksByName[n] && !mcData.itemsByName?.[n])
+  if (unused.length && process.env.BLOCKLIST_VERBOSE) console.log(`[blocklist] ${unused.length} имён не соответствуют блокам/предметам этой версии (игнорируются)` +
+    (process.env.BLOCKLIST_VERBOSE ? ': ' + unused.join(', ') : ' (BLOCKLIST_VERBOSE=1 - показать список)'))
   const max = mcData.blocksArray.reduce((m, b) => Math.max(m, b.maxStateId), 0)
   const map = new Uint8Array(max + 1).fill(def)
   for (const b of mcData.blocksArray) {
     const id = names.get(b.name) ?? (/^(air|cave_air|void_air)$/.test(b.name) ? 0 : def)
     map.fill(id, b.minStateId, b.maxStateId + 1)
   }
+  map.defs = loadBlockDefs(names)
+  map.names = names // для предметов хотбара (diamond_sword = 107 и т.п.)
   return map
 }
 
@@ -108,7 +171,7 @@ function buildLevelRaw (world, origin, stateMap) {
 }
 
 /* ------------------------- Classic-протокол ------------------------- */
-const C2S = { 0x00: 131, 0x05: 9, 0x08: 10, 0x0d: 66, 0x10: 67, 0x11: 69 } // размеры пакетов клиента
+const C2S = { 0x13: 2, 0x00: 131, 0x05: 9, 0x08: 10, 0x0d: 66, 0x10: 67, 0x11: 69 } // размеры пакетов клиента
 
 const str64 = s => {
   const b = Buffer.alloc(64, 0x20)
@@ -152,6 +215,19 @@ const P = {
     pkt(0, 8, b => { b.writeInt16BE(fx(x), 0); b.writeInt16BE(fx(y), 2); b.writeInt16BE(fx(z), 4); b[6] = yaw; b[7] = 0 })
   ]),
   model: (id, name) => Buffer.concat([Buffer.from([0x1d, id & 255]), str64(name)]), // ChangeModel
+  defineBlock (id, d, ext, xt) { // DefineBlock 0x23 / DefineBlockExt 0x25 (+16-битные текстуры при ExtendedTextures)
+    const T = d.Textures || []
+    const tex = (...is) => Buffer.concat(is.map(i => { const v = ((T[i] ?? 0) & 255) | (((T[i + 6] ?? 0) & 255) << 8); return xt ? Buffer.from([v >> 8, v & 255]) : Buffer.from([v & 255]) }))
+    const sp = Math.max(0, Math.min(255, Math.round(64 * Math.log2(d.Speed || 1) + 128)))
+    const C = d.Coords || [0, 0, 0, 16, 16, 16]; const F = d.Fog || [0, 0, 0, 0]
+    const b = x => Buffer.from(x.map(v => v & 255))
+    return Buffer.concat([
+      b([ext ? 0x25 : 0x23, id]), str64(d.Name || ('block' + id)), b([d.CollideType, sp]),
+      ext ? tex(0, 2, 3, 4, 5, 1) : tex(0, 2, 1),
+      b([d.TransmitsLight ? 1 : 0, d.WalkSound, d.FullBright ? 1 : 0]),
+      ext ? b(C) : b([d.Shape]), b([d.BlockDraw, ...F])
+    ])
+  },
   tabRemove: id => { const b = Buffer.alloc(3); b[0] = 0x18; b.writeInt16BE(id, 1); return b },
   kick: reason => Buffer.concat([Buffer.from([0x0e]), str64(reason)]),
   extInfo: (app, n) => Buffer.concat([Buffer.from([0x10]), str64(app), Buffer.from([n >> 8, n & 255])]),
@@ -163,7 +239,7 @@ const P = {
   texUrl: url => Buffer.concat([Buffer.from([0x28]), str64(url)]), // EnvSetMapUrl
   hotbar: (block, index) => Buffer.from([0x2d, block, index])
 }
-const OUR_EXTS = [['SetHotbar', 1], ['EnvMapAspect', 1], ['EnvMapAppearance', 1], ['ExtPlayerList', 2], ['EnvWeatherType', 1], ['MessageTypes', 1], ['ChangeModel', 1]]
+const OUR_EXTS = [['SetHotbar', 1], ['EnvMapAspect', 1], ['EnvMapAppearance', 1], ['ExtPlayerList', 2], ['EnvWeatherType', 1], ['MessageTypes', 1], ['ChangeModel', 1], ['CustomBlocks', 1], ['BlockDefinitions', 1], ['BlockDefinitionsExt', 2], ['ExtendedTextures', 1]]
 const TEX_FILE = process.env.TEXTURE_FILE || path.join(__dirname, 'default.zip')
 
 /** Причина кика (строка JSON или NBT из 1.20.3+) -> обычный текст. */
@@ -400,6 +476,7 @@ class Session {
     this.origin = computeOrigin(bot.entity.position, bot.game)
     this.send(P.ident(CFG.serverName, CFG.motd))
     this.sendTexture()
+    this.sendBlockDefs()
     await this.sendLevel()
     this.hookBot()
     this.ready = true
@@ -434,6 +511,15 @@ class Session {
   }
 
   /** CPE: если клиент умеет EnvMapAspect - отдаём ссылку на default.zip. */
+  /** CPE CustomBlocks + BlockDefinitions: рассылаем определения блоков из .cw; Paper отдаёт только id. */
+  sendBlockDefs () {
+    const defs = this.br.stateMap.defs
+    if (!defs?.size || !this.exts.has('CustomBlocks') || !this.exts.has('BlockDefinitions')) return
+    this.send(Buffer.from([0x13, 1])) // CustomBlocks: уровень поддержки 1
+    const ext = this.exts.has('BlockDefinitionsExt'); const xt = this.exts.has('ExtendedTextures')
+    for (const [id, d] of defs) this.send(P.defineBlock(id, d, ext, xt))
+  }
+
   sendTexture () {
     const why = !this.cpe ? 'клиент без CPE' : !fs.existsSync(TEX_FILE) ? `нет файла ${TEX_FILE}`
       : !(this.exts.has('EnvMapAspect') || this.exts.has('EnvMapAppearance')) ? 'клиент не заявил EnvMapAspect/EnvMapAppearance' : ''
@@ -700,7 +786,7 @@ function startBridge (opts = {}) {
   const br = {
     mcData,
     stateMap: buildStateMap(mcData),
-    itemId (name) { const b = mcData.blocksByName[name]; return b ? this.stateMap[b.defaultState] : undefined },
+    itemId (name) { const b = mcData.blocksByName[name]; return b ? this.stateMap[b.defaultState] : this.stateMap.names?.get(name) },
     createBot: opts.createBot || (o => require('mineflayer').createBot(o))
   }
   if (opts.http !== false) {
