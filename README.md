@@ -25,6 +25,17 @@ set LISTEN_PORT=5000
 node bridge.js
 ```
 
+## Linux
+Run in **Terminal**:
+
+```Terminal
+export MC_HOST=IP_OF_MINECRAFT_SERVER
+export MC_PORT=25565
+export BRIDGE_PASSWORD=None
+export LISTEN_PORT=5000
+node bridge.js
+```
+
 ### Variables
 
 | Variable          | Description                            |
