@@ -1,8 +1,0 @@
-# Minecraft 1.21.8 -> ClassiCube / Minecraft Classic
-# Block states/properties are ignored.
-# Unlisted blocks use the fallback below.
-default = 1
-air = 0
-
-
-#add your block here 
