@@ -55,5 +55,6 @@ After starting the bridge, connect to the bridge using **ClassiCube**.
 
 
 ## Screenshot
-<img width="1280" height="674" alt="image" src="https://github.com/user-attachments/assets/69ee627b-9a18-460a-a8a0-a753919bfcf4" />
+<img width="1280" height="674" alt="image" src="https://github.com/user-attachments/assets/2c1f537b-d315-4af7-a406-7387e1dd5bdf" />
+
 
