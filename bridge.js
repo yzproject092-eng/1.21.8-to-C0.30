@@ -38,24 +38,108 @@ const SY = 128
 const SZ = 128
 const EYE = 51 / 32 // смещение глаз в Classic-протоколе
 
-/* ------------------------- карта блоков (blocklist.txt) ------------------------- */
-// blocklist.txt НЕОБЯЗАТЕЛЕН (id берутся из .cw по имени блока); если файл есть - его строки главнее. Формат:  имя_в_Minecraft = id_ClassiCube   (# - комментарий)
-// default = N  - id для блоков, которых нет в списке. Состояния блоков игнорируются, важно только имя.
-// air / cave_air / void_air = 0, если не заданы явно.
+/* ------------------------- карта блоков (.cw, автоматически) ------------------------- */
+// blocklist.txt и ручные таблицы не нужны: id Classic берутся из .cw, а блок Paper
+// ищется по имени. Ориентации (-N/-S/-WE/...), состояния (Lit/Still/Old/...),
+// пометки "(item)", "Layer 7" и т.п. считаются вариантами одного и того же блока.
+// Если точного имени нет (лестницы, люки, ковры...), берётся цельный блок того же
+// материала: oak_stairs -> Oak Planks, brick_stairs -> Bricks.
+// Воздух остаётся воздухом, а всё, что не удалось сопоставить, показывается камнем.
 const GLASS = 20
-const BLOCKLIST_FILE = process.env.BLOCKLIST || path.join(__dirname, 'blocklist.txt')
 
-function loadBlocklist (file) {
-  const names = new Map(); let def = 1
-  let txt = ''
-  try { txt = fs.readFileSync(file, 'utf8') } catch { /* blocklist.txt необязателен */ }
-  for (const raw of txt.split(/\r?\n/)) {
-    const m = /^([a-z0-9_:]+)\s*=\s*(\d+)$/i.exec(raw.replace(/#.*$/, '').trim())
-    if (!m || +m[2] > 255) continue
-    const name = m[1].toLowerCase().replace(/^minecraft:/, '')
-    if (name === 'default') def = +m[2]; else names.set(name, +m[2])
+const normName = s => String(s).toLowerCase().replace(/['’]/g, '').replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '')
+const trimName = s => s.replace(/_+/g, '_').replace(/^_+|_+$/g, '')
+
+// служебные слова: состояние блока, а не его материал
+const STATE_WORD = /(?:^|_)(?:old|legacy|lit|unlit|still|flowing|fast|snowy|better|stacked|solid|fake|moist|active|inactive|powered|unpowered|burning|extinguished|on|off|item|optifine)(?=_|$)/
+const SHAPE_WORD = /(?:^|_)(?:post|wall|vertical|top|bottom|left|right|inner|outer|corner|single|double|edge|center|centre)(?=_|$)/
+const ORIENTATION = /(?:_(?:u|d|n|s|e|w|ud|ns|we|ne|nw|se|sw|up|down|north|south|east|west))+$/
+const NUMBERED = /_(?:level|layer|stage|age|variant|rotation)_?\d+$|_\d+_bites$/
+const FAMILY_SUFFIX = /_(?:stairs|slab|trapdoor|door|fence_gate|fence|wall|wall_sign|sign|banner|bed|carpet|button|pressure_plate|pane|bars|torch|lantern|chain|campfire|candle|rail|vine|plate)$/
+
+/** Варианты написания одного имени: точное, без состояния/ориентации, "Block of X" <-> "X Block", ед. число. */
+function nameVariants (raw) {
+  const key = normName(String(raw).replace(/^#+/, ''))
+  const out = new Map() // ключ -> приоритет (меньше = точнее)
+  const add = (k, tier) => {
+    k = trimName(k)
+    if (k && (!out.has(k) || out.get(k) > tier)) out.set(k, tier)
   }
-  return { names, def }
+  add(key, 0)
+  const blockOf = /^block_of_(.+)$/.exec(key)
+  if (blockOf) add(blockOf[1] + '_block', 0)
+  else {
+    const xBlock = /^(.+)_block$/.exec(key)
+    if (xBlock) add('block_of_' + xBlock[1], 0)
+  }
+  let k = trimName(key.replace(NUMBERED, ''))
+  k = trimName(k.replace(STATE_WORD, '_'))
+  k = trimName(k.replace(ORIENTATION, ''))
+  add(k, 2)
+  const shape = trimName(k.replace(SHAPE_WORD, '_'))
+  add(shape, 3)
+  if (/_block$/.test(shape)) add(shape.replace(/_block$/, ''), 4)
+  for (const [v, tier] of [...out]) {
+    if (v.endsWith('s') && !/(?:ss|us|is)$/.test(v)) add(v.slice(0, -1), tier + 1) // Bricks -> Brick
+  }
+  return out
+}
+
+/** Полный куб (для выбора материала лестниц/плит). */
+function isFullCube (d) {
+  if (Array.isArray(d.Coords)) return d.Coords[0] === 0 && d.Coords[1] === 0 && d.Coords[2] === 0 && d.Coords[3] === 16 && d.Coords[4] === 16 && d.Coords[5] === 16
+  return (d.Shape ?? 0) === 0
+}
+
+function betterRank (a, b) {
+  if (!b) return true
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] < b[i]
+  return false
+}
+
+/** Имя из .cw -> {id, имя, приоритет}. Для одинаковых имён выигрывает банк 0 и неориентированный вариант. */
+function buildCwIndex (defs = readCw()) {
+  const index = new Map()
+  for (const d of defs) {
+    const name = String(d.Name || '')
+    const id = d.ID2 > 0 ? d.ID2 : (d.ID & 255)
+    if (!id) continue
+    const score = (d.ID2 > 255 ? 1 : 0) + (ORIENTATION.test(normName(name)) ? 1 : 0) +
+      (/\(item\)/i.test(name) ? 2 : 0) + (/^(?:old|legacy)\b/i.test(name) ? 1 : 0) + (name.startsWith('#') ? 1 : 0)
+    for (const [key, tier] of nameVariants(name)) {
+      const c = { key, tier, score, id, name, def: d }
+      const prev = index.get(key)
+      if (!prev || tier < prev.tier || (tier === prev.tier && (score < prev.score || (score === prev.score && id < prev.id)))) index.set(key, c)
+    }
+  }
+  return index
+}
+
+/** Цельный блок того же материала, если у блока нет своего имени (oak_stairs -> oak_planks). */
+function familyMatch (name, index) {
+  const base = normName(name).replace(FAMILY_SUFFIX, '')
+  if (!base || base === normName(name)) return null
+  const words = base.split('_').filter(Boolean)
+  let best = null
+  for (const [key, c] of index) {
+    if (c.tier > 2) continue
+    const parts = key.split('_')
+    if (!words.every(w => parts.includes(w))) continue
+    const extra = parts.length - words.length
+    if (extra < 0) continue
+    const rank = extra * 2 + (isFullCube(c.def) ? 0 : 1) + (/(?:^|_)block$/.test(key) ? -1 : 0) + c.score + c.id / 100000
+    if (!best || rank < best.rank) best = { ...c, rank }
+  }
+  return best
+}
+
+/** Имя блока Paper -> определение из .cw. */
+function matchBlock (name, index) {
+  for (const [key] of [...nameVariants(name)].sort((a, b) => a[1] - b[1])) {
+    const c = index.get(key)
+    if (c) return c
+  }
+  return familyMatch(name, index)
 }
 
 /* ---- определения блоков из .cw (ClassicWorld): Metadata.CPE.BlockDefinitions ---- */
@@ -80,7 +164,6 @@ function readNbt (buf) {
   }
   p++; str(); return val(10)
 }
-const normName = s => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '')
 const CW_FILE = process.env.BLOCKDEFS || (fs.readdirSync(__dirname).find(f => /\.cw$/i.test(f)) || '')
 
 let cwCache
@@ -95,42 +178,71 @@ function readCw () {
   return cwCache
 }
 
-/** id (1..255) -> определение блока. В .cw три банка (ID2 = ID, ID+256, ID+512): берём тот, чьё имя совпало с blocklist.txt, иначе банк 0. */
-function loadBlockDefs (names) {
-  const defs = new Map()
-  if (!CW_FILE) return defs
-  const all = readCw()
-  const byId = new Map()
-  for (const d of all) { const id = d.ID & 255; if (!byId.has(id)) byId.set(id, []); byId.get(id).push(d) }
-  const used = new Set(names.values())
-  for (const id of used) {
-    if (id < 1) continue
-    const c = byId.get(id) || []
-    // банк 0 (ID2 === id) всегда главнее: одинаковый младший байт у блока и у предмета из другого банка (вода 8 и ведро воды 264)
-    const d = c.find(x => x.ID2 === id) || c.find(x => [...names].some(([n, v]) => v === id && n === normName(x.Name))) || c[0]
-    if (d) defs.set(id, d)
-  }
-  console.log(`[blockdefs] ${CW_FILE}: определений в файле ${all.length}, будет отправлено ${defs.size}`)
-  return defs
-}
-
-/** Таблица stateId -> id Classic: только по имени блока из blocklist.txt. */
-function buildStateMap (mcData, file = BLOCKLIST_FILE) {
-  const { names, def } = loadBlocklist(file) // blocklist.txt необязателен: если есть - его записи главнее
-  // авто-список из .cw: имя блока (Stone -> stone, Oak Planks -> oak_planks) -> id, только банк 0 (ID2 = ID, 1..255)
-  for (const d of readCw()) { const n = normName(d.Name); if (d.ID2 === (d.ID & 255) && d.ID2 > 0 && !names.has(n)) names.set(n, d.ID2) }
-  // имена, которых нет среди блоков и предметов версии (варианты поворота _w/_n, свои блоки и т.п.) - не ошибка, просто не используются
-  const unused = [...names.keys()].filter(n => !mcData.blocksByName[n] && !mcData.itemsByName?.[n])
-  if (unused.length && process.env.BLOCKLIST_VERBOSE) console.log(`[blocklist] ${unused.length} имён не соответствуют блокам/предметам этой версии (игнорируются)` +
-    (process.env.BLOCKLIST_VERBOSE ? ': ' + unused.join(', ') : ' (BLOCKLIST_VERBOSE=1 - показать список)'))
-  const max = mcData.blocksArray.reduce((m, b) => Math.max(m, b.maxStateId), 0)
-  const map = new Uint8Array(max + 1).fill(def)
+/** stateId -> id Classic: блоки сопоставляются с .cw по имени, без blocklist и ручных таблиц. */
+function buildStateMap (mcData) {
+  const index = buildCwIndex()
+  const hits = new Map() // имя блока -> найденное определение
+  const defRank = new Map() // исходный id .cw -> лучшее найденное определение
   for (const b of mcData.blocksArray) {
-    const id = names.get(b.name) ?? (/^(air|cave_air|void_air)$/.test(b.name) ? 0 : def)
-    map.fill(id, b.minStateId, b.maxStateId + 1)
+    if (/^(air|cave_air|void_air)$/.test(b.name)) continue
+    const hit = matchBlock(b.name, index)
+    if (!hit) continue
+    hits.set(b.name, hit)
+    const rank = [hit.tier, isFullCube(hit.def) ? 0 : 1, hit.score, hit.id]
+    const prev = defRank.get(hit.id)
+    if (!prev || betterRank(rank, prev.rank)) defRank.set(hit.id, { ...hit, rank })
   }
-  map.defs = loadBlockDefs(names)
+
+  // в Classic всего 256 id: сначала блоки банка 0 (id 1..255), затем самые нужные из банков 1-2
+  const assigned = new Map() // id в .cw -> id в Classic
+  const taken = new Set()
+  for (const id of defRank.keys()) if (id > 0 && id <= 255) { assigned.set(id, id); taken.add(id) }
+  const high = [...defRank.values()].filter(c => c.id > 255)
+    .sort((a, b) => a.rank[0] - b.rank[0] || a.rank[1] - b.rank[1] || a.rank[2] - b.rank[2] || a.id - b.id)
+  let next = 255
+  for (const c of high) {
+    while (next > 0 && taken.has(next)) next--
+    if (next <= 0) break
+    assigned.set(c.id, next); taken.add(next); next--
+  }
+
+  // для блоков, которым не хватило id, ищем тот же материал среди уже выбранных
+  const palette = buildCwIndex([...assigned.keys()].map(id => defRank.get(id).def))
+  const names = new Map() // имя блока/предмета Minecraft -> id Classic
+  const defs = new Map() // id Classic -> определение из .cw (CPE CustomBlocks)
+  for (const b of mcData.blocksArray) {
+    if (/^(air|cave_air|void_air)$/.test(b.name)) { names.set(b.name, 0); continue }
+    const hit = hits.get(b.name)
+    let id = hit && assigned.get(hit.id)
+    if (id === undefined) {
+      const fb = familyMatch(b.name, palette)
+      id = fb ? assigned.get(fb.id) : (b.boundingBox === 'empty' ? 0 : 1)
+    }
+    names.set(b.name, id)
+  }
+  for (const [origId, finalId] of assigned) defs.set(finalId, defRank.get(origId).def)
+  // предметы хотбара (diamond_sword, flint_and_steel...) - по именам из .cw
+  for (const d of readCw()) {
+    const n = normName(d.Name)
+    if (names.has(n) || mcData.blocksByName[n] || !mcData.itemsByName?.[n]) continue
+    const id = d.ID2 > 0 ? d.ID2 : (d.ID & 255)
+    if (id > 0 && id <= 255) names.set(n, id)
+  }
+
+  const max = mcData.blocksArray.reduce((m, b) => Math.max(m, b.maxStateId), 0)
+  const map = new Uint8Array(max + 1).fill(1) // незнакомый блок -> камень
+  for (const b of mcData.blocksArray) {
+    const id = names.get(b.name)
+    map.fill(id === undefined ? 1 : id, b.minStateId, b.maxStateId + 1)
+  }
+  map.defs = defs
   map.names = names // для предметов хотбара (diamond_sword = 107 и т.п.)
+  const blocks = mcData.blocksArray.filter(b => !/^(air|cave_air|void_air)$/.test(b.name))
+  console.log(`[blocks] ${CW_FILE}: автоматически сопоставлено ${hits.size} из ${blocks.length} блоков, своих определений ${defs.size}`)
+  if (process.env.MAP_VERBOSE) {
+    const miss = blocks.filter(b => !hits.has(b.name)).map(b => b.name)
+    if (miss.length) console.log('[blocks] без точного имени: ' + miss.join(', '))
+  }
   return map
 }
 
